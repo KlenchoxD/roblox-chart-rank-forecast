@@ -11,7 +11,8 @@ from pathlib import Path
 
 
 UTC = dt.timezone.utc
-SAMPLES_PER_HOUR = 256
+# More trajectories reduce Monte Carlo noise while keeping the run budget bounded.
+SAMPLES_PER_HOUR = 384
 UNKNOWN_POOL = 24
 
 
