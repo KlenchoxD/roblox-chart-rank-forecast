@@ -1,652 +1,487 @@
 #!/usr/bin/env python3
-"""Deterministic cohort forecast for Roblox's Up-and-Coming chart."""
+"""Forecast Roblox's Up-and-Coming top 10 from the chart's own history.
 
-import datetime as dt
-import heapq
+How it works (every number below is either fixed by RULES.txt or picked by replaying the history):
+
+1. Transitions. For every pair of history reads, an earlier one A and a later one B, and for each of B's
+   places 1..10, record the rank the game holding it had in A (or None: it was not on A's chart).
+   Counting these over all pairs, grouped by the gap between A and B in whole hours, says how often a
+   place is held, that many hours later, by the game that was at rank r.
+2. Window. Each scored slot sits a known number of hours after the last read. A Gaussian kernel on the
+   gap turns the counts into, per slot, the share of places held by today's rank r; the forecast is the
+   mean over the window's slots, because one forecast is scored against every hourly read. The share held
+   by games not on the chart stays unnamed, which RULES.txt spreads over the games left unnamed.
+   Every pair contributes exactly one occupant per place, so each place's named total is at most 1.
+3. Adjustments. Source ranks are smoothed in log-rank (sparse far ranks borrow from neighbours), mapped
+   onto today's chart, optionally tilted toward games that rose over the last day, and scaled down for
+   games that reach the chart's 28-day limit inside the window.
+4. Tuning. The gap bandwidth, rank width and tilt come from a replay of the contest on the history: each
+   past read is a cutoff, the reads that follow it inside a window of the task's length are scored with
+   RULES.txt's log score, and the setting with the best mean wins.
+"""
+
 import json
 import math
 import os
-import random
+from datetime import datetime, timezone
 from pathlib import Path
 
 
-UTC = dt.timezone.utc
-PATHS = 384
-MAX_CANDIDATES = 180
-# Share of the empirical rank-transition table in the final probabilities. A rolling backtest on the
-# kit's history (21 cutoffs, scored as RULES.txt scores) was flat from 0.4 to 0.7; 0.5 sits in the middle.
-TRANSITION_WEIGHT = 0.5
-HORIZON_BANDWIDTH = 8.0
+# Fixed by RULES.txt.
+TOP_SIZE = 10                 # "top10: exactly 10 distinct universe ids"
+MAX_ROWS_PER_PLACE = 100      # "a place has at most 100 rows"
+SCORE_FLOOR = 1e-4            # each place's probability is "floored at 0.0001"
+LIFETIME_HOURS = 28.0 * 24.0  # "Only games published in the last 28 days are on it"
+ROUNDING_GUARD = 1e-6         # keeps a place's printed sum <= 1 after flooring to 8 decimals
+
+# Search grids. The replay picks one value from each; the grids only bracket the data's own scales:
+# reads come 1 h (house recorder) to 11 h (archive) apart, rank moves run from a few percent to a third
+# in log terms, and the tilt runs from none to strong.
+GAP_BANDWIDTHS = (2.0, 4.0, 8.0, 16.0)
+RANK_WIDTHS = (0.0, 0.15, 0.3)
+DRIFT_TILTS = (0.0, 0.25, 0.5, 1.0)
+DRIFT_LOOKBACK_HOURS = 24.0   # one day back, so the daily player cycle cancels out of a game's drift
+MAX_REPLAYS = 120             # cutoffs replayed at most, keeping the run well inside the 300 s limit
 
 
-def parse_time(value):
-    if not isinstance(value, str) or not value:
+def hours(text):
+    """ISO 8601 time as hours since the epoch, or None."""
+    if not isinstance(text, str) or not text:
         return None
     try:
-        return dt.datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
-    except (TypeError, ValueError, OverflowError):
+        stamp = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
         return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return stamp.timestamp() / 3600.0
 
 
-def finite_number(value):
+def number(value):
+    if isinstance(value, bool):
+        return None
     try:
         result = float(value)
-        return result if math.isfinite(result) else None
     except (TypeError, ValueError, OverflowError):
         return None
+    return result if math.isfinite(result) else None
 
 
-def universe_id(value):
-    try:
-        result = int(value)
-        return result if result > 0 else None
-    except (TypeError, ValueError, OverflowError):
+def game_id(value):
+    if isinstance(value, bool):
         return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, str):
+        text = value.strip()
+        if text.isascii() and text.isdigit():
+            result = int(text)
+            return result if result > 0 else None
+    return None
 
 
-def clamp(value, low, high):
-    return min(high, max(low, value))
+def detail_items(details):
+    """(universe id, details) pairs from a read's `details`, keyed by universe id or listed."""
+    if isinstance(details, dict):
+        for key, info in details.items():
+            if isinstance(info, dict):
+                yield game_id(info.get("universe_id")) or game_id(key), info
+    elif isinstance(details, list):
+        for info in details:
+            if isinstance(info, dict):
+                yield game_id(info.get("universe_id")) or game_id(info.get("id")), info
 
 
-def chart_rows(value):
-    if isinstance(value, list):
-        return value
-    if isinstance(value, dict):
-        for key in ("games", "data", "items"):
-            if isinstance(value.get(key), list):
-                return value[key]
-    return []
-
-
-def detail_rows(value):
-    if isinstance(value, list):
-        return [(row.get("universe_id"), row) for row in value if isinstance(row, dict)]
-    if isinstance(value, dict):
-        if "universe_id" in value:
-            return [(value.get("universe_id"), value)]
-        return [
-            (row.get("universe_id", key), row)
-            for key, row in value.items()
-            if isinstance(row, dict)
-        ]
-    return []
-
-
-def weighted_median(pairs, default):
-    usable = sorted((value, weight) for value, weight in pairs if weight > 0.0 and math.isfinite(value))
-    if not usable:
-        return default
-    midpoint = sum(weight for _, weight in usable) / 2.0
-    total = 0.0
-    for value, weight in usable:
-        total += weight
-        if total >= midpoint:
-            return value
-    return usable[-1][0]
-
-
-def weighted_quantile(pairs, quantile, default):
-    usable = sorted((value, weight) for value, weight in pairs if weight > 0.0 and math.isfinite(value))
-    if not usable:
-        return default
-    target = clamp(quantile, 0.0, 1.0) * sum(weight for _, weight in usable)
-    total = 0.0
-    for value, weight in usable:
-        total += weight
-        if total >= target:
-            return value
-    return usable[-1][0]
-
-
-def new_game(uid):
-    return {
-        "uid": uid,
-        "uc": [],
-        "trending": [],
-        "playing": [],
-        "details": [],
-    }
-
-
-def collect_history(history, cutoff):
-    games = {}
-    snapshots = []
-
-    def game_for(raw_uid):
-        uid = universe_id(raw_uid)
-        if uid is None:
-            return None
-        if uid not in games:
-            games[uid] = new_game(uid)
-        return games[uid]
-
-    for read in history:
-        stamp = parse_time(read.get("at"))
-        if stamp is None or stamp > cutoff:
+def load_reads(lines, until):
+    """Chart reads started before `until`, oldest first, and each game's creation time."""
+    reads = []
+    created = {}
+    for line in lines:
+        line = line.strip()
+        if not line:
             continue
-        age = max(0.0, (cutoff - stamp).total_seconds() / 3600.0)
-        ranks = {}
-        ordered = []
-        for field, destination in (
-            ("up_and_coming", "uc"),
-            ("top_trending", "trending"),
-            ("top_playing_now", "playing"),
-        ):
-            seen = set()
-            for fallback_rank, row in enumerate(chart_rows(read.get(field)), 1):
-                if not isinstance(row, dict):
-                    continue
-                uid = universe_id(row.get("universe_id"))
-                if uid is None or uid in seen:
-                    continue
-                seen.add(uid)
-                game = game_for(uid)
-                rank = finite_number(row.get("rank")) or float(fallback_rank)
-                observation = {
-                    "time": stamp,
-                    "age": age,
-                    "rank": max(1.0, rank),
-                    "playing": finite_number(row.get("playing")),
-                    "up": finite_number(row.get("up_votes")),
-                    "down": finite_number(row.get("down_votes")),
-                }
-                game[destination].append(observation)
-                if destination == "uc":
-                    ranks[uid] = observation["rank"]
-                    ordered.append(uid)
-        for raw_uid, row in detail_rows(read.get("details")):
-            game = game_for(raw_uid)
-            if game is not None:
-                game["details"].append({"time": stamp, "age": age, "data": row})
-        if ranks:
-            # The rank field, not list order, defines the top 10.
-            top = sorted(ordered, key=lambda uid: (ranks[uid], uid))[:10]
-            snapshots.append({"time": stamp, "age": age, "ranks": ranks, "top": top})
-
-    for game in games.values():
-        for key in ("uc", "trending", "playing", "details"):
-            game[key].sort(key=lambda row: row["time"])
-    snapshots.sort(key=lambda row: row["time"])
-    return games, snapshots
-
-
-def estimate_dynamics(snapshots):
-    exits = []
-    motion = []
-    arrivals = []
-    for previous, current in zip(snapshots, snapshots[1:]):
-        gap = (current["time"] - previous["time"]).total_seconds() / 3600.0
-        if not 0.5 <= gap <= 18.0 or len(previous["top"]) < 8 or len(current["top"]) < 8:
+        try:
+            record = json.loads(line)
+        except ValueError:
             continue
-        previous_top = set(previous["top"])
-        current_top = set(current["top"])
-        retention = clamp(len(previous_top & current_top) / 10.0, 0.05, 1.0)
-        weight = math.exp(-current["age"] / 96.0)
-        exits.append((-math.log(retention) / gap, weight))
-        arrivals.append((len(current_top - previous_top) / gap, weight))
-        shared = previous["ranks"].keys() & current["ranks"].keys()
-        for uid in shared:
-            old_rank = previous["ranks"][uid]
-            new_rank = current["ranks"][uid]
-            if min(old_rank, new_rank) <= 35.0:
-                rate = abs(math.log(new_rank) - math.log(old_rank)) / math.sqrt(gap)
-                motion.append((rate, weight))
-
-    exit_hazard = clamp(weighted_median(exits, 0.018), 0.004, 0.075)
-    busy_exit_hazard = clamp(weighted_quantile(exits, 0.75, exit_hazard * 1.5), exit_hazard, 0.11)
-    entry_rate = clamp(weighted_median(arrivals, 0.12), 0.025, 0.30)
-    rank_noise = clamp(weighted_median(motion, 0.10), 0.045, 0.24)
-    newcomer_pressure = 0.0
-    if snapshots and snapshots[-1]["top"]:
-        first_seen = {}
-        for snapshot in snapshots:
-            for uid in snapshot["top"]:
-                first_seen.setdefault(uid, snapshot["time"])
-        newest_time = snapshots[-1]["time"]
-        newcomer_pressure = sum(
-            (newest_time - first_seen[uid]).total_seconds() <= 36.0 * 3600.0
-            for uid in snapshots[-1]["top"]
-        ) / len(snapshots[-1]["top"])
-    return {
-        "exit_hazard": exit_hazard,
-        "busy_exit_hazard": busy_exit_hazard,
-        "entry_rate": entry_rate,
-        "rank_noise": rank_noise,
-        "newcomer_pressure": newcomer_pressure,
-    }
-
-
-def latest(observations):
-    return observations[-1] if observations else None
-
-
-def robust_rank_velocity(observations):
-    recent = [row for row in observations if row["age"] <= 120.0]
-    rates = []
-    for older, newer in zip(recent, recent[1:]):
-        gap = (newer["time"] - older["time"]).total_seconds() / 3600.0
-        if 0.5 <= gap <= 24.0:
-            improvement = (math.log(older["rank"]) - math.log(newer["rank"])) / gap
-            rates.append((improvement, math.exp(-newer["age"] / 48.0)))
-    return clamp(weighted_median(rates, 0.0), -0.045, 0.045)
-
-
-def log_growth(observations, accessor):
-    usable = []
-    for row in observations:
-        value = accessor(row)
-        if value is not None and value >= 0.0:
-            usable.append((row, math.log1p(value)))
-    if len(usable) < 2:
-        return 0.0
-    newer_row, newer_value = usable[-1]
-    older = next(
-        ((row, value) for row, value in reversed(usable[:-1]) if newer_row["age"] + 6.0 <= row["age"]),
-        usable[0],
-    )
-    older_row, older_value = older
-    gap = max(1.0, older_row["age"] - newer_row["age"])
-    return clamp((newer_value - older_value) * 24.0 / gap, -1.8, 1.8)
-
-
-def recent_rank(game, key, maximum_age):
-    rows = [row for row in game[key] if row["age"] <= maximum_age]
-    return min((row["rank"] for row in rows), default=None)
-
-
-def build_features(games, snapshots, cutoff):
-    current = snapshots[-1] if snapshots else {"time": cutoff, "age": 0.0, "ranks": {}, "top": []}
-    recent_snapshots = [row for row in snapshots if row["age"] <= 72.0]
-    features = {}
-    for uid, game in games.items():
-        newest_uc = latest(game["uc"])
-        current_rank = current["ranks"].get(uid)
-        trend_rank = recent_rank(game, "trending", 30.0)
-        playing_rank = recent_rank(game, "playing", 30.0)
-        last_age = newest_uc["age"] if newest_uc else 999.0
-        presence = 0.0
-        if recent_snapshots:
-            presence = sum(uid in snapshot["ranks"] for snapshot in recent_snapshots) / len(recent_snapshots)
-
-        if current_rank is not None:
-            base_rank = current_rank
-        else:
-            base_rank = 140.0
-            if newest_uc is not None:
-                base_rank = min(base_rank, newest_uc["rank"] * math.exp(min(2.0, last_age / 36.0)))
-            if trend_rank is not None:
-                base_rank = min(base_rank, 13.0 + 1.15 * trend_rank)
-            if playing_rank is not None:
-                base_rank = min(base_rank, 38.0 + 1.7 * playing_rank)
-
-        velocity = robust_rank_velocity(game["uc"])
-        player_growth = log_growth(game["uc"], lambda row: row.get("playing"))
-        detail_growth = 0.0
-        if game["details"]:
-            visits = log_growth(game["details"], lambda row: finite_number(row["data"].get("visits")))
-            favorites = log_growth(game["details"], lambda row: finite_number(row["data"].get("favorites")))
-            detail_growth = 0.5 * (visits + favorites)
-
-        cross_signal = 0.0
-        if trend_rank is not None:
-            cross_signal += 0.34 * math.exp(-(trend_rank - 1.0) / 30.0)
-        if playing_rank is not None:
-            cross_signal += 0.16 * math.exp(-(playing_rank - 1.0) / 45.0)
-        quality = 0.0
-        if newest_uc and newest_uc.get("up") is not None and newest_uc.get("down") is not None:
-            up = max(0.0, newest_uc["up"])
-            down = max(0.0, newest_uc["down"])
-            if up + down >= 10.0:
-                quality = clamp(((up + 2.0) / (up + down + 4.0) - 0.78) * 0.9, -0.18, 0.18)
-
-        created = None
-        updated = None
-        if game["details"]:
-            data = game["details"][-1]["data"]
-            created = parse_time(data.get("created")) if isinstance(data, dict) else None
-            updated = parse_time(data.get("updated")) if isinstance(data, dict) else None
-        remaining = None
-        freshness = 0.0
-        if created is not None:
-            game_age = max(0.0, (cutoff - created).total_seconds() / 3600.0)
-            remaining = 28.0 * 24.0 - game_age
-            freshness += 0.16 * math.exp(-game_age / (18.0 * 24.0))
-        if updated is not None:
-            update_age = max(0.0, (cutoff - updated).total_seconds() / 3600.0)
-            freshness += 0.12 * math.exp(-update_age / (8.0 * 24.0))
-
-        signal = (
-            cross_signal
-            + quality
-            + freshness
-            + 0.08 * clamp(player_growth, -1.0, 1.0)
-            + 0.05 * clamp(detail_growth, -1.0, 1.0)
-        )
-        entry_strength = clamp(
-            0.04
-            + (0.34 if trend_rank is not None else 0.0)
-            + (0.12 if playing_rank is not None else 0.0)
-            + 0.10 * max(0.0, player_growth),
-            0.02,
-            0.72,
-        )
-        features[uid] = {
-            "uid": uid,
-            "current": current_rank is not None,
-            "base_log_rank": math.log(max(1.0, base_rank)),
-            "velocity": velocity,
-            "signal": clamp(signal, -0.35, 0.75),
-            "entry_strength": entry_strength,
-            "presence": presence,
-            "last_age": last_age,
-            "remaining": remaining,
-        }
-
-    ordered = sorted(
-        features.values(),
-        key=lambda row: (
-            not row["current"],
-            row["base_log_rank"] - row["signal"],
-            row["uid"],
-        ),
-    )
-    keep = [row for row in ordered if row["current"] or row["last_age"] <= 168.0 or row["entry_strength"] >= 0.15]
-    return {row["uid"]: row for row in keep[:MAX_CANDIDATES]}
-
-
-def sample_poisson(rng, expectation):
-    expectation = max(0.0, expectation)
-    threshold = math.exp(-expectation)
-    product = 1.0
-    count = 0
-    while product > threshold and count < 12:
-        count += 1
-        product *= rng.random()
-    return max(0, count - 1)
-
-
-def expiry_hazard(feature, hour):
-    remaining = feature["remaining"]
-    if remaining is None:
-        return 0.0
-    distance = remaining - hour
-    if distance <= 0.0:
-        return 1.0
-    if distance < 12.0:
-        return 0.12 * (12.0 - distance) / 12.0
-    return 0.0
-
-
-def stable_seed(features, slots, snapshot_count):
-    value = 1469598103934665603
-    for item in (slots, snapshot_count, *sorted(features)):
-        value ^= int(item) & ((1 << 64) - 1)
-        value = (value * 1099511628211) & ((1 << 64) - 1)
-    return value
-
-
-def simulate(features, dynamics, slots, snapshot_count):
-    uids = sorted(features)
-    accumulated = {uid: [0.0] * 10 for uid in uids}
-    rng = random.Random(stable_seed(features, slots, snapshot_count))
-    unseen_fraction = clamp(
-        0.38 + 0.45 * dynamics["entry_rate"] + 0.28 * dynamics["newcomer_pressure"],
-        0.38,
-        0.72,
-    )
-
-    for _ in range(PATHS):
-        busy_probability = 0.22 + 0.46 * dynamics["newcomer_pressure"]
-        busy_path = rng.random() < busy_probability
-        path_exit_hazard = (
-            dynamics["busy_exit_hazard"]
-            if busy_path
-            else clamp(dynamics["exit_hazard"] * 0.68, 0.003, dynamics["exit_hazard"])
-        )
-        path_entry_rate = dynamics["entry_rate"] * (1.35 if busy_path else 0.72)
-        active = {uid for uid, feature in features.items() if feature["current"]}
-        inactive_cross = {
-            uid
-            for uid, feature in features.items()
-            if not feature["current"] and feature["entry_strength"] >= 0.10
-        }
-        rank_noise = {uid: rng.gauss(0.0, 0.07) for uid in uids}
-        path_bias = {uid: rng.gauss(0.0, 0.09) for uid in uids}
-        anonymous = []
-
-        for hour in range(slots):
-            if hour > 0:
-                for uid in tuple(active):
-                    feature = features[uid]
-                    instability = 1.22 - 0.70 * feature["presence"]
-                    stale = 1.0 + min(1.0, max(0.0, feature["last_age"] - 2.0) / 48.0)
-                    hazard = path_exit_hazard * instability * stale + expiry_hazard(feature, hour)
-                    if rng.random() < clamp(hazard, 0.001, 1.0):
-                        active.remove(uid)
-                        if (
-                            feature["entry_strength"] >= 0.10
-                            and (feature["remaining"] is None or feature["remaining"] > hour)
-                        ):
-                            inactive_cross.add(uid)
-                for uid in tuple(inactive_cross):
-                    feature = features[uid]
-                    if feature["remaining"] is not None and feature["remaining"] <= hour:
-                        inactive_cross.remove(uid)
-                        continue
-                    hourly_entry = feature["entry_strength"] / 42.0
-                    hourly_entry *= math.exp(-max(0.0, feature["last_age"] - 12.0) / 96.0)
-                    if rng.random() < hourly_entry:
-                        active.add(uid)
-                        inactive_cross.remove(uid)
-
-            unknown_arrivals = sample_poisson(rng, path_entry_rate * unseen_fraction)
-            for _arrival in range(unknown_arrivals):
-                anonymous.append(
-                    {
-                        "score": -math.log(math.exp(rng.uniform(math.log(9.0), math.log(38.0)))),
-                        "drift": rng.uniform(-0.004, 0.028),
-                        "noise": rng.gauss(0.0, 0.13),
-                        "life": rng.randint(18, 96),
-                    }
-                )
-
-            ranked = []
-            for uid in active:
-                feature = features[uid]
-                innovation = rng.gauss(0.0, dynamics["rank_noise"])
-                rank_noise[uid] = 0.96 * rank_noise[uid] + 0.50 * innovation
-                momentum_shift = feature["velocity"] * 30.0 * (1.0 - math.exp(-hour / 30.0))
-                signal_shift = feature["signal"] * (1.0 - math.exp(-(hour + 4.0) / 22.0))
-                score = (
-                    -feature["base_log_rank"]
-                    + clamp(momentum_shift, -0.80, 0.80)
-                    + signal_shift
-                    + rank_noise[uid]
-                    + path_bias[uid]
-                )
-                ranked.append((score, uid))
-
-            surviving_anonymous = []
-            for index, entrant in enumerate(anonymous):
-                entrant["life"] -= 1
-                if entrant["life"] <= 0:
-                    continue
-                entrant["noise"] = 0.94 * entrant["noise"] + rng.gauss(0.0, dynamics["rank_noise"] * 0.7)
-                entrant["score"] += entrant["drift"]
-                surviving_anonymous.append(entrant)
-                ranked.append((entrant["score"] + entrant["noise"], -(index + 1)))
-            anonymous = surviving_anonymous
-
-            winners = heapq.nlargest(10, ranked, key=lambda item: (item[0], item[1]))
-            for place, (_, uid) in enumerate(winners):
-                if uid > 0:
-                    accumulated[uid][place] += 1.0
-
-    denominator = float(PATHS * max(1, slots))
-    for values in accumulated.values():
-        for place in range(10):
-            values[place] /= denominator
-    return accumulated
-
-
-def rank_bucket(rank):
-    rank = int(rank)
-    if rank <= 10:
-        return rank
-    for bucket, upper in enumerate((15, 25, 40), 11):
-        if rank <= upper:
-            return bucket
-    return 14
-
-
-def transition_table(snapshots, max_hours):
-    """Counts of (rank bucket, whole-hour gap) -> place 1..10 or off the top 10 (index 10), over every pair of reads."""
-    counts = {}
-    for index, older in enumerate(snapshots):
-        for newer in snapshots[index + 1:]:
-            hours = (newer["time"] - older["time"]).total_seconds() / 3600.0
-            if hours > max_hours:
-                break
-            for uid, rank in older["ranks"].items():
-                target = newer["ranks"].get(uid)
-                place = int(target) - 1 if target is not None and target <= 10.0 else 10
-                row = counts.setdefault((rank_bucket(rank), int(round(hours))), [0.0] * 11)
-                row[place] += 1.0
-    return counts
-
-
-def blend_transitions(probabilities, snapshots, cutoff, slots, slot_hours):
-    """Mix each charted game's simulated places with how games at its rank actually moved over the same horizons."""
-    if len(snapshots) < 2:
-        return probabilities
-    lag = max(0.0, (cutoff - snapshots[-1]["time"]).total_seconds() / 3600.0)
-    horizons = [lag + slot * slot_hours for slot in range(slots)]
-    by_bucket = {}
-    for (bucket, hour), row in transition_table(snapshots, horizons[-1] + 3.0 * HORIZON_BANDWIDTH).items():
-        by_bucket.setdefault(bucket, []).append((hour, row, sum(row)))
-    empirical = {}
-    for bucket, cells in sorted(by_bucket.items()):
-        accumulated = [0.0] * 10
-        used = 0
-        for horizon in horizons:
-            weights = [math.exp(-0.5 * ((hour - horizon) / HORIZON_BANDWIDTH) ** 2) for hour, _, _ in cells]
-            mass = sum(weight * size for weight, (_, _, size) in zip(weights, cells))
-            if mass < 1.0:  # under one effective observed transition at this horizon: leave it to the simulation
+        if not isinstance(record, dict) or record.get("ok") is False:
+            continue
+        at = hours(record.get("at"))
+        chart = record.get("up_and_coming")
+        if at is None or not isinstance(chart, list) or (until is not None and at >= until):
+            continue
+        entries = []
+        for position, row in enumerate(chart):
+            if not isinstance(row, dict) or row.get("sponsored") is True:
                 continue
-            used += 1
-            for weight, (_, row, _) in zip(weights, cells):
-                for place in range(10):
-                    accumulated[place] += weight * row[place] / mass
-        if used:
-            empirical[bucket] = [value / used for value in accumulated]
-
-    blended = dict(probabilities)
-    for uid, rank in snapshots[-1]["ranks"].items():
-        row = empirical.get(rank_bucket(rank))
-        if row is None or uid not in probabilities:
+            uid = game_id(row.get("universe_id"))
+            if uid is None:
+                continue
+            rank = number(row.get("rank"))
+            entries.append((rank if rank is not None else float(position + 1), position, uid))
+        entries.sort()
+        order = []
+        seen = set()
+        for _, _, uid in entries:
+            if uid not in seen:
+                seen.add(uid)
+                order.append(uid)
+        if not order:
             continue
-        blended[uid] = [
-            (1.0 - TRANSITION_WEIGHT) * simulated + TRANSITION_WEIGHT * observed
-            for simulated, observed in zip(probabilities[uid], row)
-        ]
-    return blended
+        for uid, info in detail_items(record.get("details")):
+            stamp = hours(info.get("created"))
+            if uid is not None and stamp is not None:
+                created.setdefault(uid, stamp)
+        reads.append({
+            "t": at,
+            "order": order,  # a game's place is its position in this list, 1 first
+            "rank": {uid: place for place, uid in enumerate(order, 1)},
+            "members": frozenset(order),
+        })
+    reads.sort(key=lambda read: read["t"])
+    # RULES.txt scores the first valid read of each UTC hour. Sampling the history the same way also keeps
+    # bursts of near-identical reads (retries, reads seconds apart) from counting one moment several times.
+    hourly = []
+    for read in reads:
+        if not hourly or math.floor(read["t"]) != math.floor(hourly[-1]["t"]):
+            hourly.append(read)
+    return hourly, created
 
 
-def format_forecast(probabilities, features, dynamics, chart_size):
-    turnover_uncertainty = clamp(
-        1.7 * dynamics["entry_rate"] + 0.8 * dynamics["newcomer_pressure"],
-        0.0,
-        1.0,
-    )
-    rows = []
-    for place in range(10):
-        calibration = clamp(
-            0.965 - 0.055 * turnover_uncertainty - 0.0065 * place,
-            0.84,
-            0.95,
-        )
-        # RULES.txt: a place's named probabilities add up to at most 1. The transition blend does not
-        # guarantee that, so scale the whole column down when needed (1e-6 covers rounding to 8 decimals).
-        column = sum(values[place] for values in probabilities.values())
-        if column > 0.0:
-            calibration = min(calibration, (1.0 - 1e-6) / column)
-        candidates = sorted(
-            ((uid, values[place] * calibration) for uid, values in probabilities.items()),
-            key=lambda item: (-item[1], item[0]),
-        )
-        named = [(uid, probability) for uid, probability in candidates[:100] if probability > 0.0]
-        # RULES.txt gives every unnamed charted game (1 - named sum) / (unnamed count) at this place;
-        # a game named below that share would score better unnamed, so drop it and recompute.
+def trusted_created(reads, created):
+    """Creation times, unless the history shows a game charted past created + 28 days (+1 h for the
+    chart's own refresh): then `created` is not the publish date the chart uses, and none is applied."""
+    for read in reads:
+        for uid in read["order"]:
+            stamp = created.get(uid)
+            if stamp is not None and read["t"] > stamp + LIFETIME_HOURS + 1.0:
+                return {}
+    return created
+
+
+def build_pairs(reads, places, max_gap):
+    """(index of the later read, gap in whole hours, rank in the earlier read of each top place's game)."""
+    pairs = []
+    for later in range(len(reads)):
+        newer = reads[later]
+        top = newer["order"][:places]
+        for earlier in range(later - 1, -1, -1):
+            older = reads[earlier]
+            gap = newer["t"] - older["t"]
+            if gap > max_gap:
+                break
+            if gap <= 0.0:
+                continue
+            pairs.append((later, int(round(gap)), tuple(older["rank"].get(uid) for uid in top)))
+    return pairs
+
+
+class Transitions:
+    def __init__(self, places):
+        self.places = places
+        self.counts = {}  # gap -> per place: {source rank or None: count}
+        self.totals = {}  # gap -> number of pairs
+
+    def add(self, gap, sources):
+        cells = self.counts.get(gap)
+        if cells is None:
+            cells = self.counts[gap] = [dict() for _ in range(self.places)]
+            self.totals[gap] = 0
+        self.totals[gap] += 1
+        for place, source in enumerate(sources):
+            cells[place][source] = cells[place].get(source, 0) + 1
+
+
+def place_shares(table, horizons, bandwidth):
+    """Per place, {source rank: share of the window's slots it holds that place}, averaged over slots."""
+    gaps = sorted(table.totals)
+    weight = dict.fromkeys(gaps, 0.0)
+    for horizon in horizons:
+        kernel = [math.exp(-0.5 * ((gap - horizon) / bandwidth) ** 2) for gap in gaps]
+        norm = sum(value * table.totals[gap] for value, gap in zip(kernel, gaps))
+        if norm > 0.0:
+            for value, gap in zip(kernel, gaps):
+                weight[gap] += value / norm
+        else:  # every gap is far from this horizon: use the nearest one alone
+            nearest = min(gaps, key=lambda gap: (abs(gap - horizon), gap))
+            weight[nearest] += 1.0 / table.totals[nearest]
+    shares = [dict() for _ in range(table.places)]
+    for gap in gaps:
+        factor = weight[gap] / len(horizons)
+        if factor <= 0.0:
+            continue
+        for place, cell in enumerate(table.counts[gap]):
+            target = shares[place]
+            for source, count in cell.items():
+                if source is not None:
+                    target[source] = target.get(source, 0.0) + factor * count
+    return shares
+
+
+def rank_kernel(source, size, width, cache):
+    """How a share from source rank `source` spreads over today's ranks 1..size (sums to at most 1)."""
+    key = (source, size, width)
+    row = cache.get(key)
+    if row is None:
+        if width <= 0.0:
+            row = ((min(source, size), 1.0),)
+        else:
+            centre = math.log(source)
+            raw = [(rank, math.exp(-0.5 * ((math.log(rank) - centre) / width) ** 2)) for rank in range(1, size + 1)]
+            total = sum(value for _, value in raw)
+            row = tuple((rank, value / total) for rank, value in raw if value > 1e-9 * total)
+        cache[key] = row
+    return row
+
+
+def smooth(shares, size, width, cache):
+    """Per place, a list indexed by today's rank (index 0 unused) of the share that rank holds."""
+    columns = []
+    for cell in shares:
+        column = [0.0] * (size + 1)
+        for source, mass in cell.items():
+            for rank, part in rank_kernel(source, size, width, cache):
+                column[rank] += mass * part
+        columns.append(column)
+    return columns
+
+
+def drift(reads, index):
+    """Each charted game's log-rank gain over about a day (absent then = one past that chart's end)."""
+    now = reads[index]
+    best = None
+    for earlier in range(index - 1, -1, -1):
+        gap = now["t"] - reads[earlier]["t"]
+        if gap > 1.5 * DRIFT_LOOKBACK_HOURS:
+            break
+        miss = abs(gap - DRIFT_LOOKBACK_HOURS)
+        if gap >= 0.5 * DRIFT_LOOKBACK_HOURS and (best is None or miss < best[0]):
+            best = (miss, earlier)
+    if best is None:
+        return {}
+    past = reads[best[1]]
+    absent = len(past["order"]) + 1
+    return {uid: math.log(past["rank"].get(uid, absent)) - math.log(rank) for uid, rank in now["rank"].items()}
+
+
+def alive_shares(now, created, start, slots, slot_hours):
+    """Share of the window's slots before each charted game turns 28 days old (games with a known date)."""
+    alive = {}
+    for uid in now["order"]:
+        stamp = created.get(uid)
+        if stamp is None or stamp + LIFETIME_HOURS <= now["t"]:
+            continue
+        end = stamp + LIFETIME_HOURS
+        alive[uid] = sum(1 for slot in range(slots) if start + slot * slot_hours < end) / slots
+    return alive
+
+
+def place_columns(smoothed, now, tilt, drift_map, alive):
+    """Per place, {universe id: probability} over today's chart."""
+    columns = []
+    for values in smoothed:
+        column = {}
+        for rank, uid in enumerate(now["order"], 1):
+            if values[rank] > 0.0:
+                column[uid] = values[rank]
+        if tilt and drift_map and column:
+            mass = sum(column.values())
+            weighted = {uid: p * math.exp(tilt * drift_map.get(uid, 0.0)) for uid, p in column.items()}
+            total = sum(weighted.values())
+            column = {uid: mass * value / total for uid, value in weighted.items()}
+        for uid, share in alive.items():
+            if uid in column:
+                column[uid] *= share
+        columns.append(column)
+    return columns
+
+
+def place_rows(columns, chart_size):
+    """Per place, the {universe id: p} actually written: at most 100 rows, sum <= 1, 8 decimals."""
+    printed_by_place = []
+    for column in columns:
+        named = sorted(((p, uid) for uid, p in column.items() if p > 0.0), key=lambda item: (-item[0], item[1]))
+        named = named[:MAX_ROWS_PER_PLACE]
+        total = sum(p for p, _ in named)
+        if total > 1.0 - ROUNDING_GUARD:
+            named = [(p * (1.0 - ROUNDING_GUARD) / total, uid) for p, uid in named]
+        # RULES.txt gives each unnamed charted game (1 - named sum) / (games left unnamed). A game named
+        # below that share would score more unnamed, so leave it out and recompute until none is.
         while named:
-            share = (1.0 - sum(probability for _, probability in named)) / max(1, chart_size - len(named))
-            kept = [(uid, probability) for uid, probability in named if probability >= share]
+            share = (1.0 - sum(p for p, _ in named)) / max(1, chart_size - len(named))
+            kept = [item for item in named if item[0] >= share]
             if len(kept) == len(named):
                 break
             named = kept
-        for uid, probability in named:
-            rows.append({"universe_id": uid, "place": place + 1, "p": round(probability, 8)})
+        printed = {}
+        for p, uid in named:
+            value = math.floor(p * 1e8) / 1e8
+            if value > 0.0:
+                printed[uid] = value
+        printed_by_place.append(printed)
+    return printed_by_place
 
-    chosen = set()
-    top10 = []
-    inclusion = {uid: sum(values) for uid, values in probabilities.items()}
-    for place in range(10):
-        available = [uid for uid in probabilities if uid not in chosen]
-        if not available:
+
+def read_score(printed_by_place, read):
+    """RULES.txt's score of one read: sum over places of ln(p of the game there), floored at 0.0001."""
+    chart = read["order"]
+    total = 0.0
+    for place, named in enumerate(printed_by_place):
+        if place >= len(chart):
             break
-        uid = max(
-            available,
-            key=lambda candidate: (
-                probabilities[candidate][place] + 0.035 * inclusion[candidate],
-                -features[candidate]["base_log_rank"],
-                -candidate,
-            ),
-        )
-        chosen.add(uid)
-        top10.append(uid)
-    if len(top10) < 10:
-        fallback = sorted(
-            (uid for uid in features if uid not in chosen),
-            key=lambda uid: (features[uid]["base_log_rank"], uid),
-        )
-        top10.extend(fallback[: 10 - len(top10)])
-    return {"probabilities": rows, "top10": top10}
+        p = named.get(chart[place])
+        if p is None:
+            unnamed = len(chart) - len(read["members"].intersection(named))
+            p = (1.0 - sum(named.values())) / unnamed if unnamed > 0 else 0.0
+        total += math.log(max(p, SCORE_FLOOR))
+    return total
 
 
-def forecast(history, task):
-    cutoff = parse_time(task.get("history_until"))
-    if cutoff is None:
-        cutoff = parse_time(task.get("window", {}).get("from"))
-    if cutoff is None and history:
-        cutoff = parse_time(history[-1].get("at"))
-    if cutoff is None:
-        cutoff = dt.datetime(1970, 1, 1, tzinfo=UTC)
+def window_targets(reads, first, start, slots, slot_hours):
+    """The read that counts for each slot: the first one started in that slot (RULES.txt, The answer)."""
+    chosen = {}
+    for read in reads[first:]:
+        offset = read["t"] - start
+        if offset < 0.0:
+            continue
+        slot = int(offset // slot_hours)
+        if slot >= slots:
+            break
+        chosen.setdefault(slot, read)
+    return list(chosen.values())
+
+
+def replay(reads, pairs, created, settings, lag, slots, slot_hours, places):
+    """Mean log score of each (bandwidth, width, tilt) setting over past cutoffs, None if none replays.
+
+    A cutoff sees only the pairs that end at or before it, and its window starts `lag` hours after it, as
+    the real window starts after the last read. A cutoff whose window runs past the history counts in
+    proportion to the part of a window it covers."""
+    last = reads[-1]["t"]
+    span = slots * slot_hours
+    candidates = [index for index in range(1, len(reads)) if reads[index]["t"] + lag < last]
+    if len(candidates) > MAX_REPLAYS:
+        picks = sorted({round(k * (len(candidates) - 1) / (MAX_REPLAYS - 1)) for k in range(MAX_REPLAYS)})
+        candidates = [candidates[pick] for pick in picks]
+    table = Transitions(places)
+    totals = [0.0] * len(settings)
+    weight_sum = 0.0
+    next_pair = 0
+    kernels = {}
+    for index in candidates:
+        while next_pair < len(pairs) and pairs[next_pair][0] <= index:
+            table.add(pairs[next_pair][1], pairs[next_pair][2])
+            next_pair += 1
+        if not table.totals:
+            continue
+        now = reads[index]
+        start = now["t"] + lag
+        targets = window_targets(reads, index + 1, start, slots, slot_hours)
+        if not targets:
+            continue
+        weight = min(1.0, (last - start) / span)
+        horizons = [lag + slot * slot_hours for slot in range(slots)]
+        alive = alive_shares(now, created, start, slots, slot_hours)
+        drift_map = None
+        share_cache = {}
+        smooth_cache = {}
+        for position, (bandwidth, width, tilt) in enumerate(settings):
+            if bandwidth not in share_cache:
+                share_cache[bandwidth] = place_shares(table, horizons, bandwidth)
+            key = (bandwidth, width)
+            if key not in smooth_cache:
+                smooth_cache[key] = smooth(share_cache[bandwidth], len(now["order"]), width, kernels)
+            if tilt and drift_map is None:
+                drift_map = drift(reads, index)
+            columns = place_columns(smooth_cache[key], now, tilt, drift_map or {}, alive)
+            printed = place_rows(columns, len(now["order"]))
+            totals[position] += weight * sum(read_score(printed, read) for read in targets) / len(targets)
+        weight_sum += weight
+    if weight_sum <= 0.0:
+        return None
+    return [total / weight_sum for total in totals]
+
+
+def choose_settings(reads, pairs, created, lag, slots, slot_hours, places):
+    """Best bandwidth and rank width with no tilt, then the best tilt for them."""
+    first = [(bandwidth, width, 0.0) for bandwidth in GAP_BANDWIDTHS for width in RANK_WIDTHS]
+    scores = replay(reads, pairs, created, first, lag, slots, slot_hours, places)
+    if scores is None:  # too little history to replay: the middle of each grid
+        return GAP_BANDWIDTHS[len(GAP_BANDWIDTHS) // 2], RANK_WIDTHS[len(RANK_WIDTHS) // 2], 0.0
+    bandwidth, width, _ = first[scores.index(max(scores))]
+    second = [(bandwidth, width, tilt) for tilt in DRIFT_TILTS]
+    scores = replay(reads, pairs, created, second, lag, slots, slot_hours, places)
+    return second[scores.index(max(scores))]
+
+
+def pick_top(columns, reads):
+    """Most likely game per place, then today's chart order to fill the ten."""
+    now = reads[-1]
+    chosen = []
+    for column in columns:
+        best = max(
+            ((p, -now["rank"].get(uid, len(now["order"]) + 1), uid) for uid, p in column.items() if uid not in chosen),
+            default=None,
+        )
+        if best is not None:
+            chosen.append(best[2])
+    for read in reversed(reads):
+        for uid in read["order"]:
+            if len(chosen) >= TOP_SIZE:
+                return chosen
+            if uid not in chosen:
+                chosen.append(uid)
+    return chosen
+
+
+def forecast(task, lines):
     window = task.get("window") if isinstance(task.get("window"), dict) else {}
-    slots = max(1, int(window.get("slots", 72) or 72))
-    slot_hours = clamp((finite_number(window.get("slot_minutes")) or 60.0) / 60.0, 0.25, 24.0)
-    games, snapshots = collect_history(history, cutoff)
-    dynamics = estimate_dynamics(snapshots)
-    features = build_features(games, snapshots, cutoff)
-    probabilities = simulate(features, dynamics, slots, len(snapshots))
-    probabilities = blend_transitions(probabilities, snapshots, cutoff, slots, slot_hours)
-    chart_size = len(snapshots[-1]["ranks"]) if snapshots else 100
-    return format_forecast(probabilities, features, dynamics, chart_size)
+    until = hours(task.get("history_until"))
+    start = hours(window.get("from"))
+    if start is None:
+        start = until
+    slots = max(1, int(number(window.get("slots")) or 72))
+    slot_hours = max(1.0 / 60.0, (number(window.get("slot_minutes")) or 60.0) / 60.0)
+    places = min(TOP_SIZE, max(1, int(number(task.get("places")) or TOP_SIZE)))
+
+    reads, created = load_reads(lines, until if until is not None else start)
+    if not reads:
+        return {"probabilities": [], "top10": []}
+    if start is None:
+        start = reads[-1]["t"]
+    lag = max(0.0, start - reads[-1]["t"])
+    pairs = build_pairs(reads, places, lag + slots * slot_hours + 3.0 * max(GAP_BANDWIDTHS))
+    created = trusted_created(reads, created)
+    bandwidth, width, tilt = choose_settings(reads, pairs, created, lag, slots, slot_hours, places)
+
+    table = Transitions(places)
+    for _, gap, sources in pairs:
+        table.add(gap, sources)
+    now = reads[-1]
+    if table.totals:
+        horizons = [lag + slot * slot_hours for slot in range(slots)]
+        smoothed = smooth(place_shares(table, horizons, bandwidth), len(now["order"]), width, {})
+        drift_map = drift(reads, len(reads) - 1) if tilt else {}
+        columns = place_columns(smoothed, now, tilt, drift_map, alive_shares(now, created, start, slots, slot_hours))
+    else:
+        columns = [dict() for _ in range(places)]
+    printed = place_rows(columns, len(now["order"]))
+    rows = [
+        {"universe_id": uid, "place": place, "p": p}
+        for place, named in enumerate(printed, 1)
+        for uid, p in named.items()
+    ]
+    return {"probabilities": rows, "top10": pick_top(columns, reads)}
 
 
 def main():
-    input_dir = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
-    output_dir = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
-    task = json.loads((input_dir / "task.json").read_text(encoding="utf-8"))
-    history = [
-        json.loads(line)
-        for line in (input_dir / "history.ndjson").read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    answer = forecast(history, task)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "forecast.json").write_text(
-        json.dumps(answer, ensure_ascii=False, separators=(",", ":")),
-        encoding="utf-8",
-    )
+    source = Path(os.environ.get("MAKEFUN_INPUT_DIR") or "/input")
+    target = Path(os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output")
+    task = json.loads((source / "task.json").read_text(encoding="utf-8"))
+    lines = (source / "history.ndjson").read_text(encoding="utf-8").splitlines()
+    answer = forecast(task if isinstance(task, dict) else {}, lines)
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "forecast.json").write_text(json.dumps(answer, separators=(",", ":")), encoding="utf-8")
 
 
 if __name__ == "__main__":
