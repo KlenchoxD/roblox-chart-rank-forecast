@@ -241,6 +241,39 @@ def utility_features(candidates, start):
     return features
 
 
+def inferred_noise_growth(history, start):
+    snapshots = []
+    for read in history:
+        stamp = parse_time(read.get("at"))
+        if stamp is None:
+            continue
+        age = (start - stamp).total_seconds() / 3600.0
+        if age < 0.0 or age > 96.0:
+            continue
+        top = []
+        for item in rows_from_chart(read.get("up_and_coming"))[:10]:
+            if isinstance(item, dict):
+                uid = safe_id(item.get("universe_id"))
+                if uid is not None:
+                    top.append(uid)
+        if len(top) == 10:
+            snapshots.append((stamp, top))
+
+    snapshots.sort(key=lambda item: item[0])
+    daily_rates = []
+    for (previous_time, previous), (current_time, current) in zip(snapshots, snapshots[1:]):
+        gap = (current_time - previous_time).total_seconds() / 3600.0
+        if 0.5 <= gap <= 24.0:
+            retention = max(0.1, len(set(previous) & set(current)) / 10.0)
+            daily_rates.append(-math.log(retention) * 24.0 / gap)
+
+    if not daily_rates:
+        return 0.12
+    daily_rates.sort()
+    typical_daily_rate = daily_rates[len(daily_rates) // 2]
+    return clamp(0.08 + 0.04 * math.sqrt(typical_daily_rate), 0.08, 0.20)
+
+
 def forecast(history, task):
     start = parse_time(task.get("window", {}).get("from")) or parse_time(task.get("history_until"))
     if start is None:
@@ -250,6 +283,7 @@ def forecast(history, task):
     slots = int(task.get("window", {}).get("slots", 72) or 72)
     candidates = make_candidates(history, start)
     features = utility_features(candidates, start)
+    noise_growth = inferred_noise_growth(history, start)
 
     # Recent chart ranks give a strong short-horizon prior. Gumbel noise grows
     # with the forecast horizon, letting the chart turn over without assuming
@@ -266,7 +300,7 @@ def forecast(history, task):
     counts = [[0] * 10 for _ in base]
     rng = random.Random(271828)
     for hour in range(slots):
-        sigma = 0.20 + 0.12 * math.sqrt(hour)
+        sigma = 0.20 + noise_growth * math.sqrt(hour)
         progress = hour / max(1, slots - 1)
         dummy_rank = max(36.0, 170.0 - 132.0 * progress)
         for draw in range(SAMPLES_PER_HOUR):
