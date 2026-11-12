@@ -115,13 +115,14 @@ def make_candidates(history, start):
     return candidates
 
 
-def weighted_log_rank(observations):
+def weighted_log_rank(observations, half_life):
     if not observations:
         return None
+    decay = max(6.0, half_life)
     weighted = []
     for obs in observations:
         age = obs["age"]
-        weight = math.exp(-age / 30.0)
+        weight = math.exp(-age / decay)
         if age <= 2.0:
             weight *= 2.0
         weighted.append((math.log(max(1.0, obs["rank"])), weight))
@@ -154,7 +155,7 @@ def growth_signal(observations, key):
     return clamp((newest[1] - older[1]) / math.sqrt(gap / 24.0), -1.5, 1.5)
 
 
-def utility_features(candidates, start):
+def utility_features(candidates, start, rank_half_life):
     latest_playing = []
     for candidate in candidates.values():
         current = [o for o in candidate["uc"] if o["age"] <= 36.0 and o["playing"] is not None]
@@ -166,7 +167,7 @@ def utility_features(candidates, start):
 
     features = {}
     for uid, c in candidates.items():
-        rank_log = weighted_log_rank(c["uc"])
+        rank_log = weighted_log_rank(c["uc"], rank_half_life)
         latest = min(c["uc"], key=lambda o: o["age"]) if c["uc"] else None
         trend_obs = [o for o in c["trend"] if o["age"] <= 12.0]
         play_now_obs = [o for o in c["playing_now"] if o["age"] <= 12.0]
@@ -186,7 +187,9 @@ def utility_features(candidates, start):
                 seed_rank = min(seed_rank, 165.0 + 0.8 * playing_now_rank)
             rank_log = math.log(seed_rank)
         last_uc_age = latest["age"] if latest else (0.0 if trend_rank is not None or playing_now_rank is not None else 999.0)
-        rank_log += min(math.log(5.0), max(0.0, last_uc_age - 2.0) * math.log(2.0) / 48.0)
+        stale_age = max(0.0, last_uc_age - 2.0)
+        stale_scale = max(12.0, 1.6 * rank_half_life)
+        rank_log += min(math.log(5.0), stale_age * math.log(2.0) / stale_scale)
         chart_tenure = 0.0
         if len(c["uc"]) > 1:
             chart_tenure = max(o["age"] for o in c["uc"]) - min(o["age"] for o in c["uc"])
@@ -262,17 +265,28 @@ def inferred_noise_growth(history, start):
 
     snapshots.sort(key=lambda item: item[0])
     daily_rates = []
+    rank_motion = []
     for (previous_time, previous), (current_time, current) in zip(snapshots, snapshots[1:]):
         gap = (current_time - previous_time).total_seconds() / 3600.0
         if 0.5 <= gap <= 24.0:
             retention = max(0.1, len(set(previous) & set(current)) / 10.0)
             daily_rates.append(-math.log(retention) * 24.0 / gap)
+            previous_rank = {uid: rank for rank, uid in enumerate(previous)}
+            current_rank = {uid: rank for rank, uid in enumerate(current)}
+            shared = previous_rank.keys() & current_rank.keys()
+            if shared:
+                displacement = sum(abs(previous_rank[uid] - current_rank[uid]) for uid in shared) / len(shared)
+                rank_motion.append(displacement * 24.0 / (9.0 * gap))
 
-    if not daily_rates:
-        return 0.12
     daily_rates.sort()
-    typical_daily_rate = daily_rates[len(daily_rates) // 2]
-    return clamp(0.08 + 0.04 * math.sqrt(typical_daily_rate), 0.08, 0.20)
+    rank_motion.sort()
+    # Membership churn captures replacement; rank motion captures turbulence
+    # that overlap alone misses when the same games trade positions.
+    typical_turnover = daily_rates[len(daily_rates) // 2] if daily_rates else 1.0
+    typical_motion = rank_motion[len(rank_motion) // 2] if rank_motion else 0.0
+    turnover_noise = 0.04 * math.sqrt(max(0.0, typical_turnover))
+    motion_noise = 0.025 * math.sqrt(max(0.0, typical_motion))
+    return clamp(0.08 + turnover_noise + motion_noise, 0.08, 0.22)
 
 
 def recent_chart_newness(history, start):
@@ -311,8 +325,9 @@ def forecast(history, task):
         start = dt.datetime(1970, 1, 1, tzinfo=UTC)
     slots = int(task.get("window", {}).get("slots", 72) or 72)
     candidates = make_candidates(history, start)
-    features = utility_features(candidates, start)
     noise_growth = inferred_noise_growth(history, start)
+    rank_half_life = clamp(30.0 * 0.12 / max(0.08, noise_growth), 18.0, 48.0)
+    features = utility_features(candidates, start, rank_half_life)
     newcomer_share = recent_chart_newness(history, start)
 
     # Recent chart ranks give a strong short-horizon prior. Gumbel noise grows
