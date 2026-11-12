@@ -13,6 +13,10 @@ from pathlib import Path
 UTC = dt.timezone.utc
 PATHS = 384
 MAX_CANDIDATES = 180
+# Share of the empirical rank-transition table in the final probabilities. A rolling backtest on the
+# kit's history (21 cutoffs, scored as RULES.txt scores) was flat from 0.4 to 0.7; 0.5 sits in the middle.
+TRANSITION_WEIGHT = 0.5
+HORIZON_BANDWIDTH = 8.0
 
 
 def parse_time(value):
@@ -155,7 +159,9 @@ def collect_history(history, cutoff):
             if game is not None:
                 game["details"].append({"time": stamp, "age": age, "data": row})
         if ranks:
-            snapshots.append({"time": stamp, "age": age, "ranks": ranks, "top": ordered[:10]})
+            # The rank field, not list order, defines the top 10.
+            top = sorted(ordered, key=lambda uid: (ranks[uid], uid))[:10]
+            snapshots.append({"time": stamp, "age": age, "ranks": ranks, "top": top})
 
     for game in games.values():
         for key in ("uc", "trending", "playing", "details"):
@@ -483,7 +489,70 @@ def simulate(features, dynamics, slots, snapshot_count):
     return accumulated
 
 
-def format_forecast(probabilities, features, dynamics):
+def rank_bucket(rank):
+    rank = int(rank)
+    if rank <= 10:
+        return rank
+    for bucket, upper in enumerate((15, 25, 40), 11):
+        if rank <= upper:
+            return bucket
+    return 14
+
+
+def transition_table(snapshots, max_hours):
+    """Counts of (rank bucket, whole-hour gap) -> place 1..10 or off the top 10 (index 10), over every pair of reads."""
+    counts = {}
+    for index, older in enumerate(snapshots):
+        for newer in snapshots[index + 1:]:
+            hours = (newer["time"] - older["time"]).total_seconds() / 3600.0
+            if hours > max_hours:
+                break
+            for uid, rank in older["ranks"].items():
+                target = newer["ranks"].get(uid)
+                place = int(target) - 1 if target is not None and target <= 10.0 else 10
+                row = counts.setdefault((rank_bucket(rank), int(round(hours))), [0.0] * 11)
+                row[place] += 1.0
+    return counts
+
+
+def blend_transitions(probabilities, snapshots, cutoff, slots, slot_hours):
+    """Mix each charted game's simulated places with how games at its rank actually moved over the same horizons."""
+    if len(snapshots) < 2:
+        return probabilities
+    lag = max(0.0, (cutoff - snapshots[-1]["time"]).total_seconds() / 3600.0)
+    horizons = [lag + slot * slot_hours for slot in range(slots)]
+    by_bucket = {}
+    for (bucket, hour), row in transition_table(snapshots, horizons[-1] + 3.0 * HORIZON_BANDWIDTH).items():
+        by_bucket.setdefault(bucket, []).append((hour, row, sum(row)))
+    empirical = {}
+    for bucket, cells in sorted(by_bucket.items()):
+        accumulated = [0.0] * 10
+        used = 0
+        for horizon in horizons:
+            weights = [math.exp(-0.5 * ((hour - horizon) / HORIZON_BANDWIDTH) ** 2) for hour, _, _ in cells]
+            mass = sum(weight * size for weight, (_, _, size) in zip(weights, cells))
+            if mass < 1.0:  # under one effective observed transition at this horizon: leave it to the simulation
+                continue
+            used += 1
+            for weight, (_, row, _) in zip(weights, cells):
+                for place in range(10):
+                    accumulated[place] += weight * row[place] / mass
+        if used:
+            empirical[bucket] = [value / used for value in accumulated]
+
+    blended = dict(probabilities)
+    for uid, rank in snapshots[-1]["ranks"].items():
+        row = empirical.get(rank_bucket(rank))
+        if row is None or uid not in probabilities:
+            continue
+        blended[uid] = [
+            (1.0 - TRANSITION_WEIGHT) * simulated + TRANSITION_WEIGHT * observed
+            for simulated, observed in zip(probabilities[uid], row)
+        ]
+    return blended
+
+
+def format_forecast(probabilities, features, dynamics, chart_size):
     turnover_uncertainty = clamp(
         1.7 * dynamics["entry_rate"] + 0.8 * dynamics["newcomer_pressure"],
         0.0,
@@ -496,13 +565,26 @@ def format_forecast(probabilities, features, dynamics):
             0.84,
             0.95,
         )
+        # RULES.txt: a place's named probabilities add up to at most 1. The transition blend does not
+        # guarantee that, so scale the whole column down when needed (1e-6 covers rounding to 8 decimals).
+        column = sum(values[place] for values in probabilities.values())
+        if column > 0.0:
+            calibration = min(calibration, (1.0 - 1e-6) / column)
         candidates = sorted(
             ((uid, values[place] * calibration) for uid, values in probabilities.items()),
             key=lambda item: (-item[1], item[0]),
         )
-        for uid, probability in candidates[:80]:
-            if probability >= 0.00025:
-                rows.append({"universe_id": uid, "place": place + 1, "p": round(probability, 8)})
+        named = [(uid, probability) for uid, probability in candidates[:100] if probability > 0.0]
+        # RULES.txt gives every unnamed charted game (1 - named sum) / (unnamed count) at this place;
+        # a game named below that share would score better unnamed, so drop it and recompute.
+        while named:
+            share = (1.0 - sum(probability for _, probability in named)) / max(1, chart_size - len(named))
+            kept = [(uid, probability) for uid, probability in named if probability >= share]
+            if len(kept) == len(named):
+                break
+            named = kept
+        for uid, probability in named:
+            rows.append({"universe_id": uid, "place": place + 1, "p": round(probability, 8)})
 
     chosen = set()
     top10 = []
@@ -538,13 +620,16 @@ def forecast(history, task):
         cutoff = parse_time(history[-1].get("at"))
     if cutoff is None:
         cutoff = dt.datetime(1970, 1, 1, tzinfo=UTC)
-    slots = int(task.get("window", {}).get("slots", 72) or 72)
-    slots = max(1, slots)
+    window = task.get("window") if isinstance(task.get("window"), dict) else {}
+    slots = max(1, int(window.get("slots", 72) or 72))
+    slot_hours = clamp((finite_number(window.get("slot_minutes")) or 60.0) / 60.0, 0.25, 24.0)
     games, snapshots = collect_history(history, cutoff)
     dynamics = estimate_dynamics(snapshots)
     features = build_features(games, snapshots, cutoff)
     probabilities = simulate(features, dynamics, slots, len(snapshots))
-    return format_forecast(probabilities, features, dynamics)
+    probabilities = blend_transitions(probabilities, snapshots, cutoff, slots, slot_hours)
+    chart_size = len(snapshots[-1]["ranks"]) if snapshots else 100
+    return format_forecast(probabilities, features, dynamics, chart_size)
 
 
 def main():
