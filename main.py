@@ -333,6 +333,78 @@ def recent_chart_newness(history, start):
     return newcomers / len(latest_ids)
 
 
+def empirical_rank_volatility(history, start):
+    snapshots = []
+    for read in history:
+        stamp = parse_time(read.get("at"))
+        if stamp is None or stamp > start:
+            continue
+        age = (start - stamp).total_seconds() / 3600.0
+        if age > 120.0:
+            continue
+        ranks = {}
+        for fallback_rank, item in enumerate(rows_from_chart(read.get("up_and_coming")), 1):
+            if not isinstance(item, dict):
+                continue
+            uid = safe_id(item.get("universe_id"))
+            rank = number(item.get("rank")) or float(fallback_rank)
+            if uid is not None and uid not in ranks:
+                ranks[uid] = max(1.0, rank)
+        if ranks:
+            snapshots.append((stamp, ranks))
+
+    snapshots.sort(key=lambda item: item[0])
+    all_rates = []
+    top_rates = []
+    for (previous_time, previous), (current_time, current) in zip(snapshots, snapshots[1:]):
+        gap = (current_time - previous_time).total_seconds() / 3600.0
+        if not 0.5 <= gap <= 24.0:
+            continue
+        for uid in previous.keys() & current.keys():
+            change = math.log(current[uid]) - math.log(previous[uid])
+            rate = change / math.sqrt(gap)
+            all_rates.append(rate)
+            if min(previous[uid], current[uid]) <= 20.0:
+                top_rates.append(rate)
+
+    def rms(values):
+        return math.sqrt(sum(value * value for value in values) / len(values)) if values else 0.0
+
+    broad = rms(all_rates)
+    elite = rms(top_rates)
+    if len(top_rates) >= 30:
+        return clamp(0.35 * broad + 0.65 * elite, 0.06, 0.18)
+    if all_rates:
+        return clamp(broad, 0.06, 0.18)
+    return 0.11
+
+
+def normal_cdf(value):
+    return 0.5 * (1.0 + math.erf(value / math.sqrt(2.0)))
+
+
+def rank_probability(log_mean, log_sigma, place):
+    lower_rank = max(0.5, place - 0.5)
+    upper_rank = place + 0.5
+    upper = normal_cdf((math.log(upper_rank) - log_mean) / log_sigma)
+    lower = normal_cdf((math.log(lower_rank) - log_mean) / log_sigma) if place > 1 else 0.0
+    return max(0.0, upper - lower)
+
+
+def age_survival(candidate, start, horizon):
+    if not candidate["details"]:
+        return 1.0
+    detail = min(candidate["details"], key=lambda row: row["age"])["data"]
+    created = parse_time(detail.get("created")) if isinstance(detail, dict) else None
+    if created is None:
+        return 1.0
+    age_hours = max(0.0, (start - created).total_seconds() / 3600.0)
+    remaining = 28.0 * 24.0 - age_hours
+    if horizon <= remaining:
+        return 1.0
+    return math.exp(-(horizon - remaining) / 6.0)
+
+
 def forecast(history, task):
     start = parse_time(task.get("window", {}).get("from")) or parse_time(task.get("history_until"))
     if start is None:
@@ -345,61 +417,78 @@ def forecast(history, task):
     rank_half_life = clamp(30.0 * 0.12 / max(0.08, noise_growth), 18.0, 48.0)
     features = utility_features(candidates, start, rank_half_life)
     newcomer_share = recent_chart_newness(history, start)
+    volatility = empirical_rank_volatility(history, start)
+    uids = sorted(uid for uid, c in candidates.items()
+                  if features[uid]["last_age"] <= 168.0
+                  or min((o["age"] for o in c["trend"] + c["playing_now"]), default=999.0) <= 36.0)
+    if not uids:
+        uids = sorted(features)
 
-    # Recent chart ranks give a strong short-horizon prior. Gumbel noise grows
-    # with the forecast horizon, letting the chart turn over without assuming
-    # that the latest order persists for all three days.
-    uids = sorted(features)
-    unknown_start = len(uids)
-    base = []
-    for uid in uids:
-        f = features[uid]
-        base.append(-f["rank_log"] + f["trend_bonus"] + f["playing_now_bonus"] + f["player_level"] * 0.5 + f["vote_signal"] + f["age_bonus"] + f["update_bonus"] + f["detail_growth"])
-    for _ in range(UNKNOWN_POOL):
-        base.append(-math.log(170.0))
-
-    counts = [[0] * 10 for _ in base]
-    rng = random.Random(271828)
+    # Forecast each game's place distribution from its rank trajectory. The
+    # historical rank-difference scale widens the kernel with time; momentum
+    # moves its center modestly, then decays rather than extrapolating linearly.
+    accumulated = [[0.0] * 10 for _ in uids]
+    turnover = clamp((noise_growth - 0.08) / 0.14, 0.0, 1.0)
     for hour in range(slots):
-        sigma = 0.20 + noise_growth * math.sqrt(hour)
         progress = hour / max(1, slots - 1)
-        dummy_rank = max(28.0, 170.0 - (134.0 + 24.0 * newcomer_share) * progress)
-        for draw in range(SAMPLES_PER_HOUR):
-            scores = []
-            for i, value in enumerate(base):
-                if i >= unknown_start:
-                    utility = -math.log(dummy_rank)
-                else:
-                    f = features[uids[i]]
-                    utility = value + 0.28 * f["momentum"] * math.exp(-hour / 36.0)
-                    utility += 0.11 * f["player_growth"] * math.exp(-hour / 48.0)
-                    utility -= min(math.log(5.0), max(0.0, f["last_age"] - 2.0) / 48.0 * math.log(2.0)) * 0.28
-                    utility -= progress * min(0.28, max(0.0, f["last_age"] - 10.0) / 240.0)
-                    utility -= progress * min(0.22, max(0.0, f["chart_tenure"] - 48.0) / 360.0)
-                uniform = min(1.0 - 1e-12, max(1e-12, rng.random()))
-                noise = -math.log(-math.log(uniform))
-                scores.append((utility + sigma * noise, i))
-            best = heapq.nlargest(10, scores)
-            for place, (_, index) in enumerate(best):
-                if index < unknown_start:
-                    counts[index][place] += 1
+        known_mass = 1.0 - clamp(0.07 + 0.17 * progress + 0.08 * newcomer_share + 0.06 * turnover, 0.07, 0.42)
+        by_place = [[] for _ in range(10)]
+        for uid in uids:
+            f = features[uid]
+            candidate = candidates[uid]
+            drift = clamp(0.18 * f["momentum"] + 0.05 * f["player_growth"], -0.25, 0.25)
+            trend_distance = 1.0 - math.exp(-hour / 36.0)
+            rank_signal = (
+                0.65 * f["trend_bonus"]
+                + 0.35 * f["playing_now_bonus"]
+                + 0.15 * f["player_level"]
+                + f["vote_signal"]
+                + f["age_bonus"]
+                + f["update_bonus"]
+                + f["detail_growth"]
+            )
+            log_mean = f["rank_log"] - drift * trend_distance - clamp(rank_signal, -0.35, 0.45)
+            last_age = f["last_age"]
+            sigma = math.sqrt((0.16 + 0.004 * min(24.0, last_age)) ** 2 + volatility * volatility * hour)
+            sigma = max(0.16, sigma)
+            survival = age_survival(candidate, start, hour)
+            stale_weight = math.exp(-max(0.0, last_age - 2.0) / 72.0)
+            for place in range(1, 11):
+                likelihood = rank_probability(log_mean, sigma, place) * survival * stale_weight
+                by_place[place - 1].append(likelihood)
 
-    total_draws = max(1, slots * SAMPLES_PER_HOUR)
-    probabilities = [[counts[i][place] / total_draws for place in range(10)] for i in range(unknown_start)]
+        hourly = [[0.0] * 10 for _ in uids]
+        for place, likelihoods in enumerate(by_place):
+            total = sum(likelihoods)
+            if total <= 1e-15:
+                continue
+            for index, likelihood in enumerate(likelihoods):
+                hourly[index][place] = known_mass * likelihood / total
+
+        # A game's ten place marginals cannot claim more than one place.
+        for index, values in enumerate(hourly):
+            row_mass = sum(values)
+            if row_mass > 1.0:
+                scale = 1.0 / row_mass
+                values = [value * scale for value in values]
+                hourly[index] = values
+            for place, probability in enumerate(values):
+                accumulated[index][place] += probability / slots
+
     rows = []
     for place in range(10):
-        order = sorted(range(unknown_start), key=lambda i: probabilities[i][place], reverse=True)
+        order = sorted(range(len(uids)), key=lambda i: accumulated[i][place], reverse=True)
         for i in order[:100]:
-            p = probabilities[i][place]
-            if p >= 0.0007:
+            p = accumulated[i][place]
+            if p >= 0.0001:
                 rows.append({"universe_id": uids[i], "place": place + 1, "p": round(p, 8)})
 
-    # A separate expected-order summary drives the top10 tie-break field.
+    # Expected rank probability gives the requested ordered top-ten estimate.
     order_strength = []
     for i, uid in enumerate(uids):
-        p = probabilities[i]
-        hit_weight = sum((11 - k) * p[k - 1] for k in range(1, 11))
-        expected_place = sum(k * p[k - 1] for k in range(1, 11)) / max(1e-12, sum(p))
+        p = accumulated[i]
+        hit_weight = sum((11 - place) * p[place - 1] for place in range(1, 11))
+        expected_place = sum(place * p[place - 1] for place in range(1, 11)) / max(1e-12, sum(p))
         order_strength.append((uid, hit_weight, expected_place))
     order_strength.sort(key=lambda item: (-item[1], item[2], item[0]))
     top10 = [uid for uid, _, _ in order_strength[:10]]
