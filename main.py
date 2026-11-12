@@ -11,8 +11,8 @@ from pathlib import Path
 
 
 UTC = dt.timezone.utc
-# More trajectories reduce Monte Carlo noise while keeping the run budget bounded.
-SAMPLES_PER_HOUR = 512
+# 640 trajectories per slot reduce rank-probability Monte Carlo noise at low cost.
+SAMPLES_PER_HOUR = 640
 UNKNOWN_POOL = 24
 
 
@@ -275,6 +275,34 @@ def inferred_noise_growth(history, start):
     return clamp(0.08 + 0.04 * math.sqrt(typical_daily_rate), 0.08, 0.20)
 
 
+def recent_chart_newness(history, start):
+    first_seen_age = {}
+    latest_stamp = None
+    latest_ids = []
+    for read in history:
+        stamp = parse_time(read.get("at"))
+        if stamp is None or stamp > start:
+            continue
+        age = max(0.0, (start - stamp).total_seconds() / 3600.0)
+        ids = []
+        # Measure churn on the scored top ten, not unseen lower chart ranks.
+        for item in rows_from_chart(read.get("up_and_coming"))[:10]:
+            if not isinstance(item, dict):
+                continue
+            uid = safe_id(item.get("universe_id"))
+            if uid is None:
+                continue
+            ids.append(uid)
+            first_seen_age[uid] = max(age, first_seen_age.get(uid, 0.0))
+        if latest_stamp is None or stamp > latest_stamp:
+            latest_stamp = stamp
+            latest_ids = list(dict.fromkeys(ids))
+    if not latest_ids:
+        return 0.0
+    newcomers = sum(first_seen_age.get(uid, float("inf")) <= 24.0 for uid in latest_ids)
+    return newcomers / len(latest_ids)
+
+
 def forecast(history, task):
     start = parse_time(task.get("window", {}).get("from")) or parse_time(task.get("history_until"))
     if start is None:
@@ -285,6 +313,7 @@ def forecast(history, task):
     candidates = make_candidates(history, start)
     features = utility_features(candidates, start)
     noise_growth = inferred_noise_growth(history, start)
+    newcomer_share = recent_chart_newness(history, start)
 
     # Recent chart ranks give a strong short-horizon prior. Gumbel noise grows
     # with the forecast horizon, letting the chart turn over without assuming
@@ -303,7 +332,7 @@ def forecast(history, task):
     for hour in range(slots):
         sigma = 0.20 + noise_growth * math.sqrt(hour)
         progress = hour / max(1, slots - 1)
-        dummy_rank = max(36.0, 170.0 - 132.0 * progress)
+        dummy_rank = max(28.0, 170.0 - (134.0 + 24.0 * newcomer_share) * progress)
         for draw in range(SAMPLES_PER_HOUR):
             scores = []
             for i, value in enumerate(base):
