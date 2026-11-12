@@ -75,6 +75,17 @@ def log_count(value):
     return math.log1p(max(0.0, value)) if value is not None else None
 
 
+def chart_observation(item, fallback_rank, age_hours, target):
+    rank = number(item.get("rank"))
+    if rank is None or rank <= 0.0:
+        rank = float(fallback_rank)
+    observation = {"age": age_hours, "rank": rank, "playing": number(item.get("playing"))}
+    if target == "uc":
+        observation["up"] = number(item.get("up_votes"))
+        observation["down"] = number(item.get("down_votes"))
+    return observation
+
+
 def make_candidates(history, start):
     candidates = {}
 
@@ -88,26 +99,31 @@ def make_candidates(history, start):
 
     for read in history:
         stamp = parse_time(read.get("at"))
-        if stamp is None:
+        if stamp is None or stamp > start:
             continue
-        age_hours = max(0.0, (start - stamp).total_seconds() / 3600.0)
+        age_hours = (start - stamp).total_seconds() / 3600.0
         for field, target in (("up_and_coming", "uc"), ("top_trending", "trend"), ("top_playing_now", "playing_now")):
+            observed_ids = set()
             for fallback_rank, item in enumerate(rows_from_chart(read.get(field)), 1):
                 if not isinstance(item, dict):
                     continue
-                candidate = get_candidate(item.get("universe_id"))
+                uid = safe_id(item.get("universe_id"))
+                if uid is None or uid in observed_ids:
+                    continue
+                observed_ids.add(uid)
+                candidate = get_candidate(uid)
                 if candidate is None:
                     continue
-                rank = number(item.get("rank")) or float(fallback_rank)
-                obs = {"age": age_hours, "rank": max(1.0, rank), "playing": number(item.get("playing"))}
-                if target == "uc":
-                    obs["up"] = number(item.get("up_votes"))
-                    obs["down"] = number(item.get("down_votes"))
-                candidate[target].append(obs)
+                candidate[target].append(chart_observation(item, fallback_rank, age_hours, target))
                 if item.get("name"):
                     candidate["name"] = str(item["name"])
+        observed_details = set()
         for raw_uid, item in detail_rows(read.get("details")):
-            candidate = get_candidate(raw_uid)
+            uid = safe_id(raw_uid)
+            if uid is None or uid in observed_details:
+                continue
+            observed_details.add(uid)
+            candidate = get_candidate(uid)
             if candidate is not None:
                 candidate["details"].append({"age": age_hours, "data": item})
                 if item.get("name"):
